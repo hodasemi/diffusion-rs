@@ -47,6 +47,8 @@ metal = ["diffusion-rs-sys/metal"]
 vulkan = ["diffusion-rs-sys/vulkan"]
 sycl = ["diffusion-rs-sys/sycl"]
 
+default = ["vulkan"]
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

@@ -13,6 +13,7 @@ use chrono::Local;
 use derive_builder::Builder;
 use diffusion_rs_sys::free_upscaler_ctx;
 use diffusion_rs_sys::generate_image;
+use diffusion_rs_sys::generate_video;
 use diffusion_rs_sys::new_upscaler_ctx;
 use diffusion_rs_sys::sd_cache_mode_t;
 use diffusion_rs_sys::sd_cache_params_t;
@@ -31,6 +32,7 @@ use diffusion_rs_sys::sd_set_preview_callback;
 use diffusion_rs_sys::sd_set_progress_callback;
 use diffusion_rs_sys::sd_slg_params_t;
 use diffusion_rs_sys::sd_tiling_params_t;
+use diffusion_rs_sys::sd_vid_gen_params_t;
 use diffusion_rs_sys::upscaler_ctx_t;
 use image::ImageBuffer;
 use image::ImageError;
@@ -728,9 +730,13 @@ pub struct Config {
     #[builder(default = "Default::default()")]
     pm_id_images_dir: CLibPath,
 
-    /// Path to the input image, required by img2img
+    /// Path to the input image, required by img2img, optional for [gen_vid]
     #[builder(default = "Default::default()")]
     init_img: PathBuf,
+
+    /// Path to the end image, optional for [gen_vid]
+    #[builder(default = "Default::default()")]
+    end_img: PathBuf,
 
     /// Path to the image used as a mask for img2img
     #[builder(default = "Default::default()")]
@@ -1101,6 +1107,201 @@ unsafe fn upscale(
             None => Ok(data),
         }
     }
+}
+
+pub fn gen_vid(
+    config: &Config,
+    model_config: &mut ModelConfig,
+    video_frames: i32,
+) -> Result<(), DiffusionError> {
+    gen_vid_maybe_progress(config, model_config, video_frames, None)
+}
+
+fn gen_vid_maybe_progress(
+    config: &Config,
+    model_config: &mut ModelConfig,
+    video_frames: i32,
+    mut _sender: Option<Sender<Progress>>,
+) -> Result<(), DiffusionError> {
+    let prompt: CLibString = CLibString::from(config.prompt.as_str());
+    let files = output_files(&config.output, video_frames);
+
+    unsafe {
+        let has_init_image = config.init_img.exists();
+        let has_end_image = config.end_img.exists();
+
+        let is_decode_only = !has_init_image;
+        let sd_ctx = model_config.diffusion_ctx(is_decode_only);
+        let upscaler_ctx = model_config.upscaler_ctx();
+
+        let mut init_image = sd_image_t {
+            width: 0,
+            height: 0,
+            channel: 3,
+            data: null_mut(),
+        };
+
+        let mut end_image = sd_image_t {
+            width: 0,
+            height: 0,
+            channel: 3,
+            data: null_mut(),
+        };
+
+        let mut init_image_buffer: Vec<u8> = Vec::new();
+        let mut end_image_buffer: Vec<u8> = Vec::new();
+
+        if has_init_image {
+            let img = image::open(&config.init_img)?;
+            init_image_buffer = img.to_rgb8().into_raw();
+
+            init_image = sd_image_t {
+                width: img.width(),
+                height: img.height(),
+                channel: 3,
+                data: init_image_buffer.as_mut_ptr(),
+            }
+        }
+
+        if has_end_image {
+            let img = image::open(&config.end_img)?;
+            end_image_buffer = img.to_rgb8().into_raw();
+
+            end_image = sd_image_t {
+                width: img.width(),
+                height: img.height(),
+                channel: 3,
+                data: end_image_buffer.as_mut_ptr(),
+            }
+        }
+
+        let mut layers = config.skip_layer.clone();
+        let guidance = sd_guidance_params_t {
+            txt_cfg: config.cfg_scale,
+            img_cfg: config.cfg_scale,
+            distilled_guidance: config.guidance,
+            slg: sd_slg_params_t {
+                layers: layers.as_mut_ptr(),
+                layer_count: config.skip_layer.len(),
+                layer_start: config.skip_layer_start,
+                layer_end: config.skip_layer_end,
+                scale: config.slg_scale,
+            },
+        };
+        let scheduler = if model_config.scheduler == Scheduler::SCHEDULER_COUNT {
+            sd_get_default_scheduler(sd_ctx, config.sampling_method)
+        } else {
+            model_config.scheduler
+        };
+        let sample_method = if config.sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+            sd_get_default_sample_method(sd_ctx)
+        } else {
+            config.sampling_method
+        };
+        let sample_params = sd_sample_params_t {
+            guidance,
+            sample_method,
+            sample_steps: config.steps,
+            eta: config.eta,
+            scheduler,
+            shifted_timestep: model_config.timestep_shift,
+            custom_sigmas: model_config.sigmas.as_mut_ptr(),
+            custom_sigmas_count: model_config.sigmas.len() as i32,
+            flow_shift: model_config.flow_shift,
+        };
+        let high_noise_sample_params = sd_sample_params_t {
+            guidance,
+            sample_method,
+            sample_steps: config.steps,
+            eta: config.eta,
+            scheduler,
+            shifted_timestep: model_config.timestep_shift,
+            custom_sigmas: model_config.sigmas.as_mut_ptr(),
+            custom_sigmas_count: model_config.sigmas.len() as i32,
+            flow_shift: model_config.flow_shift,
+        };
+        let mut control_image = sd_image_t {
+            width: 0,
+            height: 0,
+            channel: 3,
+            data: null_mut(),
+        };
+        let vae_tiling_params = sd_tiling_params_t {
+            enabled: model_config.vae_tiling,
+            tile_size_x: model_config.vae_tile_size.0,
+            tile_size_y: model_config.vae_tile_size.1,
+            target_overlap: model_config.vae_tile_overlap,
+            rel_size_x: model_config.vae_relative_tile_size.0,
+            rel_size_y: model_config.vae_relative_tile_size.1,
+        };
+
+        let loras: Vec<sd_lora_t> = model_config
+            .lora_models
+            .iter()
+            .map(|(c_path, spec)| sd_lora_t {
+                is_high_noise: spec.is_high_noise,
+                multiplier: spec.multiplier,
+                path: c_path.as_ptr(),
+            })
+            .collect();
+
+        let mut cache = config.cache.0;
+        if let Some(scm_mask) = &config.cache.1 {
+            cache.scm_mask = scm_mask.as_ptr();
+        }
+
+        let vid_gen_params = sd_vid_gen_params_t {
+            lora_count: loras.len() as u32,
+            loras: loras.as_ptr(),
+            prompt: prompt.as_ptr(),
+            negative_prompt: config.negative_prompt.as_ptr(),
+            clip_skip: config.clip_skip as i32,
+            init_image,
+            end_image,
+            control_frames: &mut control_image,
+            control_frames_size: 1,
+            high_noise_sample_params,
+            moe_boundary: 1.0,
+            video_frames,
+            vace_strength: 1.0,
+            vae_tiling_params,
+            cache,
+            width: config.width,
+            height: config.height,
+            sample_params,
+            strength: config.strength,
+            seed: config.seed,
+        };
+
+        let mut frames_out = 0;
+        let out_images = generate_video(sd_ctx, &vid_gen_params, &mut frames_out);
+
+        if out_images.is_null() {
+            return Err(DiffusionError::Forward);
+        }
+
+        for (img, path) in slice::from_raw_parts(out_images, frames_out as usize)
+            .iter()
+            .zip(files)
+        {
+            // img.data will be null on OOM or other generation errors,
+            // in which case we skip saving and just return an error
+            if img.data.is_null() {
+                return Err(DiffusionError::Forward);
+            }
+
+            match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
+                Ok(img) => save_img(img, &path, None)?,
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        }
+
+        free(out_images as *mut c_void);
+    }
+
+    Ok(())
 }
 
 /// Generate an image and receive update via queue
